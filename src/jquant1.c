@@ -826,8 +826,13 @@ _jinit_1pass_quantizer(j_decompress_ptr cinfo)
   if (cinfo->data_precision != BITS_IN_JSAMPLE)
     ERREXIT1(cinfo, JERR_BAD_PRECISION, cinfo->data_precision);
 
-  /* Color quantization is not supported with lossless JPEG images */
-  if (cinfo->master->lossless)
+  /* Make sure jdmaster didn't give me a case I can't handle.  Color
+   * quantization is not supported with lossless JPEG images.  It is also not
+   * supported with RGB565 output, because the RGB565 color converter packs
+   * each pixel into two _JSAMPLEs but out_color_components is still 3, so the
+   * color index table would be indexed with packed pixel values.
+   */
+  if (cinfo->master->lossless || cinfo->out_color_space == JCS_RGB565)
     ERREXIT(cinfo, JERR_NOTIMPL);
 
   cquantize = (my_cquantize_ptr)
