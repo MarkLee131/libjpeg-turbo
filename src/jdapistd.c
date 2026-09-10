@@ -478,6 +478,31 @@ increment_simple_rowgroup_ctr(j_decompress_ptr cinfo, JDIMENSION rows)
   read_and_discard_scanlines(cinfo, rows_left);
 }
 
+
+/*
+ * Re-derive the upsampler's "rows_to_go" from output_scanline.  Both
+ * upsamplers keep such a counter and use it to stop at the bottom of the
+ * image (jdsample.c, jdmerge.c), and neither sees the rows that
+ * _jpeg_skip_scanlines() steps over without running it.
+ */
+
+LOCAL(void)
+set_rows_to_go(j_decompress_ptr cinfo)
+{
+#ifdef UPSAMPLE_MERGING_SUPPORTED
+  my_master_ptr master = (my_master_ptr)cinfo->master;
+
+  if (master->using_merged_upsample) {
+    my_merged_upsample_ptr upsample = (my_merged_upsample_ptr)cinfo->upsample;
+    upsample->rows_to_go = cinfo->output_height - cinfo->output_scanline;
+  } else
+#endif
+  {
+    my_upsample_ptr upsample = (my_upsample_ptr)cinfo->upsample;
+    upsample->rows_to_go = cinfo->output_height - cinfo->output_scanline;
+  }
+}
+
 /*
  * Skips some scanlines of data from the JPEG decompressor.
  *
@@ -500,6 +525,7 @@ _jpeg_skip_scanlines(j_decompress_ptr cinfo, JDIMENSION num_lines)
   int y;
   JDIMENSION lines_per_iMCU_row, lines_left_in_iMCU_row, lines_after_iMCU_row;
   JDIMENSION lines_to_skip, lines_to_read;
+  JDIMENSION lines_requested = num_lines;
 
   if (cinfo->data_precision != BITS_IN_JSAMPLE)
     ERREXIT1(cinfo, JERR_BAD_PRECISION, cinfo->data_precision);
@@ -527,6 +553,26 @@ _jpeg_skip_scanlines(j_decompress_ptr cinfo, JDIMENSION num_lines)
   if (num_lines == 0)
     return 0;
 
+  /* The row group bookkeeping below assumes that the upsampler is positioned
+   * at the start of a row group.  When it is part-way through one, it still
+   * owes the remaining rows of that group, and none of the paths below account
+   * for them, so they end up being handed to the caller after the skip as if
+   * they were the rows that follow it.  Read them out here instead.  Context
+   * row upsampling has its own handling further down and is left alone.
+   */
+  if (!cinfo->upsample->need_context_rows &&
+      cinfo->output_scanline % cinfo->max_v_samp_factor != 0) {
+    JDIMENSION rows_left_in_group = cinfo->max_v_samp_factor -
+      (cinfo->output_scanline % cinfo->max_v_samp_factor);
+
+    if (rows_left_in_group > num_lines)
+      rows_left_in_group = num_lines;
+    read_and_discard_scanlines(cinfo, rows_left_in_group);
+    if (num_lines == rows_left_in_group)
+      return lines_requested;
+    num_lines -= rows_left_in_group;
+  }
+
   lines_per_iMCU_row = cinfo->_min_DCT_scaled_size * cinfo->max_v_samp_factor;
   lines_left_in_iMCU_row =
     (lines_per_iMCU_row - (cinfo->output_scanline % lines_per_iMCU_row)) %
@@ -550,7 +596,7 @@ _jpeg_skip_scanlines(j_decompress_ptr cinfo, JDIMENSION num_lines)
         (lines_left_in_iMCU_row <= 1 && main_ptr->buffer_full &&
          lines_after_iMCU_row < lines_per_iMCU_row + 1)) {
       read_and_discard_scanlines(cinfo, num_lines);
-      return num_lines;
+      return lines_requested;
     }
 
     /* If the next iMCU row has already been entropy-decoded, make sure that
@@ -580,15 +626,15 @@ _jpeg_skip_scanlines(j_decompress_ptr cinfo, JDIMENSION num_lines)
   else {
     if (num_lines < lines_left_in_iMCU_row) {
       increment_simple_rowgroup_ctr(cinfo, num_lines);
-      return num_lines;
+      set_rows_to_go(cinfo);
+      return lines_requested;
     } else {
       cinfo->output_scanline += lines_left_in_iMCU_row;
       main_ptr->buffer_full = FALSE;
       main_ptr->rowgroup_ctr = 0;
-      if (!master->using_merged_upsample) {
+      if (!master->using_merged_upsample)
         upsample->next_row_out = cinfo->max_v_samp_factor;
-        upsample->rows_to_go = cinfo->output_height - cinfo->output_scanline;
-      }
+      set_rows_to_go(cinfo);
     }
   }
 
@@ -623,9 +669,8 @@ _jpeg_skip_scanlines(j_decompress_ptr cinfo, JDIMENSION num_lines)
       cinfo->output_iMCU_row += lines_to_skip / lines_per_iMCU_row;
       increment_simple_rowgroup_ctr(cinfo, lines_to_read);
     }
-    if (!master->using_merged_upsample)
-      upsample->rows_to_go = cinfo->output_height - cinfo->output_scanline;
-    return num_lines;
+    set_rows_to_go(cinfo);
+    return lines_requested;
   }
 
   /* Skip the iMCU rows that we can safely skip. */
@@ -675,11 +720,10 @@ _jpeg_skip_scanlines(j_decompress_ptr cinfo, JDIMENSION num_lines)
    * bit odd, since "rows_to_go" seems to be redundantly keeping track of
    * output_scanline.
    */
-  if (!master->using_merged_upsample)
-    upsample->rows_to_go = cinfo->output_height - cinfo->output_scanline;
+  set_rows_to_go(cinfo);
 
   /* Always skip the requested number of lines. */
-  return num_lines;
+  return lines_requested;
 }
 
 /*
